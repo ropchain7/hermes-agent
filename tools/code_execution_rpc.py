@@ -58,7 +58,8 @@ def _default_dispatch(task_id, session_id=None, turn_id=None, conversation_id=No
                                             conversation_id=conversation_id)
             return handle_function_call(tool_name, tool_args, task_id=task_id, session_id=session_id,
                                         turn_id=turn_id, conversation_id=conversation_id,
-                                        tool_call_id=tool_call_id)
+                                        tool_call_id=tool_call_id,
+                                        parent_tool_call_id=owner_tool_call_id)
     return dispatch
 
 

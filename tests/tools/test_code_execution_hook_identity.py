@@ -254,11 +254,226 @@ def test_the_poll_loop_forwards_the_owner_and_a_refused_call_takes_no_id(tmp_pat
     assert counter[0] == 2, "a refused call must not consume budget or an id"
 
 
+IDENTITY_KEYS = {
+    "task_id", "session_id", "tool_call_id", "turn_id", "api_request_id", "conversation_id",
+    "parent_tool_call_id",
+}
+
+BASE_IDENTITY = {
+    "task_id": "task-A", "session_id": "", "tool_call_id": "",
+    "turn_id": "", "api_request_id": "", "conversation_id": "",
+}
+
+
 def test_the_identity_record_keeps_its_hook_contract():
-    """PR 1 adds no field to the identity record: the hook payload stays exactly six keys."""
+    """T11 — the record gains exactly one field. RED on the base, which has six keys."""
     import model_tools
 
-    assert set(model_tools._CallIds("task-A").hook_kwargs()) == {
-        "task_id", "session_id", "tool_call_id", "turn_id", "api_request_id", "conversation_id",
-    }
-    assert model_tools._CallIds("task-A").hook_kwargs()["tool_call_id"] == ""
+    kwargs = model_tools._CallIds("task-A").hook_kwargs()
+    assert set(kwargs) == IDENTITY_KEYS, (
+        "the identity record must carry exactly seven keys; "
+        f"missing={sorted(IDENTITY_KEYS - set(kwargs))} extra={sorted(set(kwargs) - IDENTITY_KEYS)}"
+    )
+    assert kwargs["tool_call_id"] == ""
+    assert kwargs["parent_tool_call_id"] == ""
+
+
+def test_top_level_payload_carries_the_seventh_identity_key(tmp_path, hook_calls):
+    """T3 — top-level, unidentified fixture: seven identity keys, both ids empty. RED on the base."""
+    target = tmp_path / "note.txt"
+    target.write_text("hello\n", encoding="utf-8")
+
+    result = json.loads(handle_function_call("read_file", {"path": str(target)}, task_id="task-A"))
+    assert result.get("status", "success") == "success", result
+
+    payloads = _nested(hook_calls, "read_file")
+    assert len(payloads) == 1, payloads
+    payload = payloads[0]
+
+    identity = {k: v for k, v in payload.items() if k in IDENTITY_KEYS}
+    assert set(identity) == IDENTITY_KEYS, (
+        "the pre_tool_call payload must carry seven identity keys; "
+        f"missing={sorted(IDENTITY_KEYS - set(identity))} extra={sorted(set(identity) - IDENTITY_KEYS)}"
+    )
+    assert identity["tool_call_id"] == ""
+    assert identity["parent_tool_call_id"] == ""
+
+
+@pytest.fixture
+def post_payloads():
+    """Capture what reaches the post_tool_call hook, which rebuilds its payload by hand."""
+    seen = []
+
+    def _invoke(hook_name, *args, **kwargs):
+        seen.append((hook_name, kwargs))
+
+    with patch("hermes_cli.lifecycle.has_hook", return_value=True), \
+         patch("hermes_cli.lifecycle.invoke_hook", side_effect=_invoke):
+        yield seen
+
+
+def test_ownerless_payload_delta_is_exactly_the_new_key(tmp_path, post_payloads):
+    """T4b — the emitted post payload is today's dict plus one key, and nothing else differs. RED on the base."""
+    target = tmp_path / "note.txt"
+    target.write_text("hello\n", encoding="utf-8")
+
+    result = json.loads(handle_function_call("read_file", {"path": str(target)}, task_id="task-A"))
+    assert result.get("status", "success") == "success", result
+
+    emitted = [kw for name, kw in post_payloads if name == "post_tool_call"]
+    assert len(emitted) == 1, emitted
+    payload = emitted[0]
+
+    assert "parent_tool_call_id" in payload, (
+        "the seventh identity key is absent from the emitted post_tool_call payload"
+    )
+    identity = {k: v for k, v in payload.items() if k in IDENTITY_KEYS}
+    assert identity == {**BASE_IDENTITY, "parent_tool_call_id": ""}, identity
+
+
+# ── W6 remainder: parentage through both dispatch paths, guards, consumers ────
+
+
+def test_local_cell_child_carries_its_owner_as_parent(hook_calls):
+    """T1 — CellAuthority child: tool_call_id == "<owner>#1", parent_tool_call_id == "<owner>"."""
+    from tools.code_kernel import CellAuthority
+
+    CellAuthority("task-A", "sess-A", "turn-A", "conv-A", "B1").dispatch("web_search", {"query": "a"})
+
+    payloads = _nested(hook_calls, "web_search")
+    assert len(payloads) == 1, payloads
+    assert payloads[0]["tool_call_id"] == "B1#1"
+    assert payloads[0]["parent_tool_call_id"] == "B1"
+
+
+def test_remote_dispatch_child_carries_its_owner_as_parent(hook_calls):
+    """T2 — the same two equalities through _default_dispatch."""
+    _default_dispatch("task-A", "sess-A", "turn-A", "conv-A", "B7")("web_search", {"query": "b"})
+
+    payloads = _nested(hook_calls, "web_search")
+    assert len(payloads) == 1, payloads
+    assert payloads[0]["tool_call_id"] == "B7#1"
+    assert payloads[0]["parent_tool_call_id"] == "B7"
+
+
+def test_ownerless_dispatch_passes_neither_id():
+    """T4a — baseline guard: an ownerless call keeps today's call shape (no id keywords at all)."""
+    import model_tools
+
+    seen = []
+
+    def _spy(*args, **kwargs):
+        seen.append(kwargs)
+        return '{"status": "success"}'
+
+    with patch.object(model_tools, "handle_function_call", _spy):
+        _default_dispatch("task-A")("web_search", {"query": "x"})
+
+    assert len(seen) == 1, seen
+    assert "tool_call_id" not in seen[0], seen[0]
+    assert "parent_tool_call_id" not in seen[0], seen[0]
+
+
+def test_interleaved_cells_keep_their_own_owners(hook_calls):
+    """T5 — two owners interleaved: every child points at its own owner, never the sibling's."""
+    from tools.code_kernel import CellAuthority
+
+    a = CellAuthority("task-A", "sess-A", "turn-A", "conv-A", "B1")
+    b = CellAuthority("task-A", "sess-A", "turn-A", "conv-A", "B2")
+    a.dispatch("web_search", {"query": "a1"})
+    b.dispatch("web_search", {"query": "b1"})
+    a.dispatch("web_search", {"query": "a2"})
+    b.dispatch("web_search", {"query": "b2"})
+
+    pairs = [(p["tool_call_id"], p["parent_tool_call_id"]) for p in _nested(hook_calls, "web_search")]
+    assert pairs == [("B1#1", "B1"), ("B2#1", "B2"), ("B1#2", "B1"), ("B2#2", "B2")], pairs
+
+
+def test_nested_execution_is_refused_by_the_cell_sandbox(hook_calls):
+    """T6 — conditional, and the branch that applies here is the refusal.
+
+    §7 makes T6 red when nested execution is supported and a baseline guard when the runtime refuses it.
+    The cell sandbox (SANDBOX_ALLOWED_TOOLS) does not include `execute_code`, so the refusal is the
+    expected behaviour and asserting it is the correct outcome — recorded, not skipped.
+    """
+    code = "from hermes_tools import execute_code\nprint(execute_code('print(1)'))"
+    result = json.loads(handle_function_call(
+        "execute_code", {"code": code}, task_id="task-A", session_id="sess-A", turn_id="turn-A",
+        conversation_id="conv-A", tool_call_id="B9", enabled_tools=["execute_code", "read_file"]))
+
+    body = json.dumps(result).lower()
+    # Measured branch (2026-11-23): hermes_tools does not expose execute_code, so the cell raises
+    # ImportError and no nested dispatch happens. Asserted as the expected behaviour, not skipped.
+    assert result.get("status") == "error", result
+    assert "importerror" in body and "execute_code" in body, result
+    assert result.get("tool_calls_made", 0) == 0, result
+    # The only lifecycle event is the OUTER call; no nested entry is dispatched.
+    outer = _nested(hook_calls, "execute_code")
+    assert len(outer) == 1, outer
+    assert outer[0]["tool_call_id"] == "B9"
+    # NOTE: the outer event's parent value is deliberately NOT asserted here. §7 makes T6 a
+    # base-independent guard when nesting is refused; asserting the seventh key would make it a
+    # contract test and it would be red on the base for the wrong reason. That property is covered
+    # by T3 (unidentified top-level) and by T8 (identified child) instead.
+
+
+def test_strict_and_kwargs_consumers_receive_the_parent():
+    """T8 — delivery at the callback level: a legacy explicit signature and a **kwargs consumer,
+    on both pre_tool_call and post_tool_call, for one top-level call and one owned child.
+    This is the test that fails if E4b (pre) or E3b (post) is missing."""
+    from hermes_cli.plugins import get_plugin_manager
+
+    mgr = get_plugin_manager()
+    pre_legacy, pre_kwargs, post_legacy, post_kwargs = [], [], [], []
+
+    def legacy_pre(tool_name, args, task_id="", session_id="", tool_call_id="", turn_id="",
+                   api_request_id="", middleware_trace=None, conversation_id=""):
+        pre_legacy.append({"tool_name": tool_name, "tool_call_id": tool_call_id})
+
+    def legacy_post(tool_name, args, result, task_id="", session_id="", tool_call_id="", turn_id="",
+                    api_request_id="", duration_ms=0, status=None, error_type=None, error_message=None,
+                    middleware_trace=None, conversation_id=""):
+        post_legacy.append({"tool_name": tool_name, "tool_call_id": tool_call_id})
+
+    def kwargs_pre(**kw):
+        pre_kwargs.append(kw)
+
+    def kwargs_post(**kw):
+        post_kwargs.append(kw)
+
+    for name, cb in (("pre_tool_call", legacy_pre), ("pre_tool_call", kwargs_pre),
+                     ("post_tool_call", legacy_post), ("post_tool_call", kwargs_post)):
+        mgr._hooks.setdefault(name, []).append(cb)
+    try:
+        import os
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        # Two distinct files: a second read of the same path is deduplicated ("unchanged"), which
+        # would make this test assert the wrong thing.
+        top_path = os.path.join(tmp, "top.txt")
+        child_path = os.path.join(tmp, "child.txt")
+        for p in (top_path, child_path):
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write("hello\n")
+
+        top = json.loads(handle_function_call("read_file", {"path": top_path}, task_id="task-A"))
+        assert top.get("status", "success") == "success", top
+
+        child = json.loads(handle_function_call(
+            "read_file", {"path": child_path}, task_id="task-A", session_id="sess-A", turn_id="turn-A",
+            conversation_id="conv-A", tool_call_id="B5#1", parent_tool_call_id="B5"))
+        assert child.get("status", "success") == "success", child
+    finally:
+        for name, cb in (("pre_tool_call", legacy_pre), ("pre_tool_call", kwargs_pre),
+                         ("post_tool_call", legacy_post), ("post_tool_call", kwargs_post)):
+            mgr._hooks.get(name, []).remove(cb)
+
+    assert len(pre_legacy) == 2 and len(post_legacy) == 2, (pre_legacy, post_legacy)
+    assert len(pre_kwargs) == 2 and len(post_kwargs) == 2, (pre_kwargs, post_kwargs)
+
+    assert pre_kwargs[0]["parent_tool_call_id"] == ""      # top-level, unidentified
+    assert pre_kwargs[1]["parent_tool_call_id"] == "B5"    # owned child
+    assert post_kwargs[0]["parent_tool_call_id"] == ""
+    assert post_kwargs[1]["parent_tool_call_id"] == "B5"
+    assert pre_kwargs[1]["tool_call_id"] == "B5#1"
+    assert post_kwargs[1]["tool_call_id"] == "B5#1"

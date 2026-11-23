@@ -336,6 +336,7 @@ class CellAuthority:
                 # Only when this cell owns the batch: an unowned call keeps today's call shape, so
                 # a narrow stand-in for handle_function_call is not broken by an undeclared keyword.
                 identity["tool_call_id"] = tool_call_id
+                identity["parent_tool_call_id"] = self.owner_tool_call_id
             with programmatic_file_read(), suppress_post_tool_call_hook(False):
                 return handle_function_call(tool_name, tool_args, task_id=self.task_id, **identity)
         finally:
